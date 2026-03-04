@@ -1,0 +1,178 @@
+name: cicd-guard
+run-name: cicd-guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+    branches: [dev, stage, prod-*]
+
+permissions:
+  contents: read            # read repo to list files
+  pull-requests: write      # request reviewers
+  issues: write             # add/remove labels
+
+env:
+  LABEL_NAME: "ci/cd"                 # label to apply when CI/CD-related changes detected
+  CODEOWNERS_LOGINS: ${{ vars.CODEOWNERS_LOGINS }}    # comma-separated GitHub logins treated as CODEOWNERS (set in repo/org Variables)
+
+jobs:
+  cicd_guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Guard base branch
+        id: guard
+        run: |
+          case "${{ github.base_ref }}" in
+            dev|stage|prod-*) echo "ok=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "ok=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: List PR changed files via API
+        id: files
+        if: steps.guard.outputs.ok == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              { owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number, per_page: 100 }
+            );
+            const names = files.map(f => f.filename);
+            core.info('Changed files:\n' + names.join('\n'));
+            core.setOutput('files', JSON.stringify(names));
+      - name: Detect CI/CD-related changes
+        id: detect
+        if: steps.guard.outputs.ok == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Make FILES available to the Python process as an env var
+          export FILES='${{ steps.files.outputs.files }}'
+          python - <<'PY'
+          import json, re, os
+          files = json.loads(os.environ['FILES'])
+          patterns = [
+              re.compile(r'^\.github/workflows/'),   # workflows
+              re.compile(r'^k8s/'),                  # k8s manifests
+              re.compile(r'(^|/)Dockerfile($|/)'),   # any Dockerfile in any folder
+              re.compile(r'^\.releaserc(\.json)?$'), # semantic-release config
+          ]
+          matched = [f for f in files if any(p.search(f) for p in patterns)]
+          changed = bool(matched)
+          print("CI/CD changed:", changed)
+          print("Matched files:\n" + "\n".join(matched) if matched else "Matched files: <none>")
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              fh.write(f"changed={'true' if changed else 'false'}\n")
+              fh.write("matched<<EOF\n" + ("\n".join(matched) if matched else "") + "\nEOF\n")
+          PY
+
+      - name: Show matched files (debug)
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          echo "Matched CI/CD files:"
+          echo "${{ steps.detect.outputs.matched }}"
+
+      - name: Ensure label exists
+        if: steps.guard.outputs.ok == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const name = process.env.LABEL_NAME;
+            const color = '0e8a16';
+            const description = 'PR touches CI/CD (workflows/k8s/Dockerfile)';
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner, repo: context.repo.repo, name
+              });
+              core.info(`Label '${name}' exists`);
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner, repo: context.repo.repo, name, color, description
+                });
+                core.info(`Label '${name}' created`);
+              } else {
+                throw e;
+              }
+            }
+
+      - name: Apply or remove label
+        if: steps.guard.outputs.ok == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const name = process.env.LABEL_NAME;
+            const changed = '${{ steps.detect.outputs.changed }}' === 'true';
+            const { data: curr } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number
+            });
+            const has = curr.some(l => l.name.toLowerCase() === name.toLowerCase());
+            if (changed && !has) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, labels: [name]
+              });
+              core.info(`Label '${name}' added`);
+            } else if (!changed && has) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, name
+              }).catch(e => { if (e.status !== 404) throw e; });
+              core.info(`Label '${name}' removed`);
+            } else {
+              core.info(`Label '${name}': no change`);
+            }
+
+      - name: Auto-request CODEOWNER review
+        if: steps.detect.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const reviewers = process.env.CODEOWNERS_LOGINS.split(',').map(s => s.trim()).filter(Boolean);
+            if (reviewers.length) {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                pull_number: pr.number,
+                reviewers
+              }).catch(e => {
+                // ignore "already requested" or "can't request author"
+                if (e.status !== 422) throw e;
+              });
+              core.info('Requested reviewers: ' + reviewers.join(', '));
+            }
+
+      - name: Check CODEOWNER approval
+        id: approval
+        if: steps.detect.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const owners = new Set(process.env.CODEOWNERS_LOGINS.split(',').map(s => s.trim()).filter(Boolean));
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number, per_page: 100
+            });
+            const last = new Map();
+            for (const r of reviews) {
+              if (r.user?.login) last.set(r.user.login, r.state);
+            }
+            const ok = [...last.entries()].some(([u,s]) => owners.has(u) && s === 'APPROVED');
+            core.info(`CODEOWNER approved: ${ok}`);
+            core.setOutput('approved', ok ? 'true' : 'false');
+
+      - name: Gate
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          if [ "${{ steps.detect.outputs.changed }}" != "true" ]; then
+            echo "No CI/CD changes — pass"
+            exit 0
+          fi
+          if [ "${{ steps.approval.outputs.approved }}" = "true" ]; then
+            echo "Approved by CODEOWNER — pass"
+            exit 0
+          fi
+          echo "CI/CD files were modified. CODEOWNER approval required."
+          exit 1

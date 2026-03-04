@@ -1,0 +1,71 @@
+name: cicd-guard-rerun-on-approve
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  rerun_guard:
+    if: ${{ github.event.review.state == 'approved' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Re-run cicd-guard for current PR head SHA
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.info('No pull_request in payload (unexpected).');
+              return;
+            }
+
+            const headSha = pr.head.sha;
+            core.info(`PR #${pr.number}, head_sha=${headSha}`);
+
+            // 1) Find workflow by name "cicd-guard"
+            const workflows = await github.paginate(
+              github.rest.actions.listRepoWorkflows,
+              { owner, repo, per_page: 100 }
+            );
+
+            const wf = workflows.find(w => w.name === 'cicd-guard');
+            if (!wf) {
+              core.setFailed('Workflow with name "cicd-guard" not found. Check the workflow name in YAML.');
+              return;
+            }
+
+            core.info(`Found workflow: ${wf.name} (id=${wf.id})`);
+
+            // 2) List recent runs of that workflow triggered by pull_request
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              { owner, repo, workflow_id: wf.id, event: 'pull_request', per_page: 50 }
+            );
+
+            // 3) Pick run that matches current head_sha
+            const run = runs.find(r => r.head_sha === headSha);
+
+            if (!run) {
+              core.setFailed(`No pull_request run found for head_sha=${headSha}. Ask to re-run manually once, or push a commit to trigger a run.`);
+              return;
+            }
+
+            core.info(`Re-running run_id=${run.id}, status=${run.status}, conclusion=${run.conclusion}`);
+
+            await github.rest.actions.reRunWorkflow({
+              owner,
+              repo,
+              run_id: run.id
+            });
+
+            core.info('Re-run requested successfully.');

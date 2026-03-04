@@ -1,0 +1,183 @@
+name: 2. PROMOUTE RELEASE TO PRODUCTION
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Stage version tag to promote (format: vX.Y.Z). Example: v1.27.0"
+        required: true
+        type: string
+      confirm:
+        description: "Type YES to confirm promotion"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write   # required to push to GHCR
+
+env:
+  TAG_PREFIX: "v"
+  PROD_TAG_PREFIX: "production"
+  ALLOWED_ACTORS: ${{ vars.ALLOWED_ACTORS }}    # comma-separated GitHub logins of release managers (set in repo/org Variables)
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Guard allow workflow run only from dev
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.ref_name }}" != "dev" ]; then
+            echo "::error title=Wrong branch::This workflow must be started from 'dev' branch only."
+            exit 1
+          fi
+
+      - name: Guard allow only release managers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTOR="$(printf '%s' "${{ github.actor }}" | tr '[:upper:]' '[:lower:]')"
+          ALLOWED="$(printf '%s' "${{ env.ALLOWED_ACTORS }}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+
+          case ",${ALLOWED}," in
+            *",${ACTOR},"*) ;;
+            *)
+              echo "::error title=Not allowed::User '${{ github.actor }}' is not allowed to promote releases to production."
+              exit 1
+              ;;
+          esac
+
+      - name: Validate inputs
+        id: validate
+        shell: bash
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+
+          VERSION_TAG="$(echo "${VERSION_TAG}" | tr -d '[:space:]')"
+          CONFIRM="$(echo "${CONFIRM}" | tr -d '[:space:]')"
+
+          if [ -z "${VERSION_TAG}" ]; then
+            echo "::error title=Invalid input::version_tag is empty. Provide tag like v1.27.0"
+            exit 1
+          fi
+
+          if ! echo "${VERSION_TAG}" | grep -Eq "^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+$"; then
+            echo "::error title=Invalid version tag::Got '${VERSION_TAG}'. Expected format: vX.Y.Z (example: v1.27.0)"
+            exit 1
+          fi
+
+          if [ "${CONFIRM}" != "YES" ]; then
+            echo "::error title=Confirmation required::You must type YES in the confirm field to proceed."
+            exit 1
+          fi
+
+          PROD_TAG="${PROD_TAG_PREFIX}/${VERSION_TAG}"
+          PROD_IMAGE_TAG="${PROD_TAG_PREFIX}-${VERSION_TAG}"
+          echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+          echo "prod_tag=${PROD_TAG}" >> "$GITHUB_OUTPUT"
+          echo "prod_image_tag=${PROD_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Promotion intent::Will promote '${VERSION_TAG}' to git tag '${PROD_TAG}' and image tag '${PROD_IMAGE_TAG}'."
+
+      - name: Get GitHub App token (release bot)
+        id: bot
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Checkout repository (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.bot.outputs.token }}
+
+      - name: Fetch all tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+
+      - name: Ensure stage tag exists
+        id: ensure_stage_tag
+        shell: bash
+        env:
+          VERSION_TAG: ${{ steps.validate.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+
+          if ! git rev-parse -q --verify "refs/tags/${VERSION_TAG}" >/dev/null 2>&1; then
+            echo "::error title=Tag not found::Stage tag '${VERSION_TAG}' does not exist."
+            exit 1
+          fi
+
+          SHA="$(git rev-list -n 1 "${VERSION_TAG}")"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Stage tag resolved::${VERSION_TAG} -> ${SHA}"
+
+
+      - name: Ensure production git tag does not already exist
+
+        shell: bash
+        env:
+          PROD_TAG: ${{ steps.validate.outputs.prod_tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/${PROD_TAG}" >/dev/null 2>&1; then
+            echo "::error title=Already promoted::Production tag '${PROD_TAG}' already exists."
+            exit 1
+          fi
+
+      - name: Create and push production git tag (annotated)
+        shell: bash
+        env:
+          VERSION_TAG: ${{ steps.validate.outputs.version_tag }}
+          PROD_TAG: ${{ steps.validate.outputs.prod_tag }}
+          SHA: ${{ steps.ensure_stage_tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+          git tag -a "${PROD_TAG}" "${SHA}" -m "Promote ${VERSION_TAG} to production"
+          git push origin "refs/tags/${PROD_TAG}"
+
+          echo "::notice title=Promotion complete::Created '${PROD_TAG}' at ${SHA}"
+
+      # ==========================================================
+      # PROMOTE DOCKER IMAGE: vX.Y.Z  ->  production-vX.Y.Z
+      # ==========================================================
+      - name: Promote Docker image to production tag
+        shell: bash
+        env:
+          VERSION_TAG: ${{ steps.validate.outputs.version_tag }}
+          PROD_IMAGE_TAG: ${{ steps.validate.outputs.prod_image_tag }}
+        run: |
+          set -euo pipefail
+
+          OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+
+          SRC_IMAGE="ghcr.io/${OWNER}/backend_service:${VERSION_TAG}"
+          DST_IMAGE="ghcr.io/${OWNER}/backend_service:${PROD_IMAGE_TAG}"
+
+          echo "Promoting image:"
+          echo "  ${SRC_IMAGE}"
+          echo "→ ${DST_IMAGE}"
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          docker pull "${SRC_IMAGE}"
+          docker tag  "${SRC_IMAGE}" "${DST_IMAGE}"
+          docker push "${DST_IMAGE}"
+
+          echo "::notice title=Image promoted::${SRC_IMAGE} -> ${DST_IMAGE}"

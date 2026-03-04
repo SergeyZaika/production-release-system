@@ -1,0 +1,201 @@
+name: 3. STAGE > PROD
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target production environment (namespace)"
+        type: choice
+        required: true
+        options:
+          - prod-region-1
+          - prod-region-2
+          - prod-region-3
+          - prod-region-4
+          - prod-region-5
+          - prod-region-6
+      production_image_tag:
+        description: "Production image tag (only production-vX.Y.Z, e.g. production-v0.0.8)"
+        type: string
+        required: true
+      run_migration:
+        description: "Run migration job before deploy"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+
+    env:
+      NAMESPACE: ${{ inputs.environment }}
+      PRODUCTION_IMAGE_TAG: ${{ inputs.production_image_tag }}
+      RUN_MIGRATION: ${{ inputs.run_migration }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate inputs (normalize)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Trim spaces just in case
+          PRODUCTION_IMAGE_TAG="$(echo "${PRODUCTION_IMAGE_TAG}" | tr -d '[:space:]')"
+          echo "PRODUCTION_IMAGE_TAG=${PRODUCTION_IMAGE_TAG}" >> "$GITHUB_ENV"
+
+          # Normalize RUN_MIGRATION to 'true'/'false' string
+          RUN_MIGRATION_NORM="$(echo "${RUN_MIGRATION}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          if [ "${RUN_MIGRATION_NORM}" = "true" ]; then
+            RUN_MIGRATION_NORM="true"
+          else
+            RUN_MIGRATION_NORM="false"
+          fi
+          echo "RUN_MIGRATION=${RUN_MIGRATION_NORM}" >> "$GITHUB_ENV"
+
+          if ! echo "${PRODUCTION_IMAGE_TAG}" | grep -Eq '^production-v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error title=Invalid production tag::Got '${PRODUCTION_IMAGE_TAG}'. Expected: production-vX.Y.Z (example: production-v0.0.8)"
+            exit 1
+          fi
+
+      - name: Compute image variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO_OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE_NAME="ghcr.io/${REPO_OWNER}/backend_service:${PRODUCTION_IMAGE_TAG}"
+
+          echo "REPO_OWNER=${REPO_OWNER}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${PRODUCTION_IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> "$GITHUB_ENV"
+          echo "repo_owner=${REPO_OWNER}" >> "$GITHUB_OUTPUT"
+          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Deploy plan::Namespace='${NAMESPACE}', Image='${IMAGE_NAME}', run_migration='${RUN_MIGRATION}'"
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Check image exists in GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking image: ${IMAGE_NAME}"
+          if ! docker manifest inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+            echo "::error title=Image not found::Image '${IMAGE_NAME}' does not exist in GHCR."
+            exit 1
+          fi
+
+      - name: Set up kubectl (match cluster)
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.32.5"
+
+      - name: Set up Kubeconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBECONFIG_EU_1 }}" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Preflight (access + versions + deployment)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "kubectl client:"
+          kubectl version --client=true
+
+          echo "Cluster version:"
+          kubectl version
+
+          kubectl -n "${NAMESPACE}" get deployment backend-deployment >/dev/null
+
+      - name: Show current deployed image
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" get deployment backend-deployment \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="backend")].image}'; echo
+
+      - name: Ensure envsubst exists (only for migration)
+        if: env.RUN_MIGRATION == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v envsubst >/dev/null 2>&1; then
+            echo "envsubst is already available."
+            envsubst --version || true
+            exit 0
+          fi
+
+          echo "envsubst not found, installing gettext-base..."
+          sudo apt-get update
+          sudo apt-get install -y gettext-base
+
+          command -v envsubst >/dev/null 2>&1
+
+      - name: Delete old migration job if exists
+        if: env.RUN_MIGRATION == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" delete job backend-migration --ignore-not-found=true
+
+      - name: Run migration job (before deploy)
+        if: env.RUN_MIGRATION == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Applying migration job with image: ${IMAGE_NAME}"
+          envsubst < k8s/backend-migration-job.yaml | kubectl apply -n "${NAMESPACE}" -f -
+
+      - name: Wait for migration to complete and show logs
+        if: env.RUN_MIGRATION == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x .github/workflows/wait_for_migration.sh
+          NAMESPACE="${NAMESPACE}" .github/workflows/wait_for_migration.sh
+
+      - name: Cleanup finished migration job
+        if: env.RUN_MIGRATION == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 10
+          kubectl -n "${NAMESPACE}" delete job backend-migration --ignore-not-found=true
+
+      - name: Deploy (set image)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" set image deployment/backend-deployment \
+            backend="${IMAGE_NAME}"
+
+      - name: Verify rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" rollout status deployment/backend-deployment
+          kubectl -n "${NAMESPACE}" get pods --no-headers -o wide
+          echo "Deployed image:"
+          kubectl -n "${NAMESPACE}" get deployment backend-deployment \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="backend")].image}'; echo

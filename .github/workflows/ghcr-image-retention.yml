@@ -1,0 +1,136 @@
+name: ghcr-image-retention
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_last_nonprod:
+        description: "How many latest NON-production versions to keep (production-v* is never deleted)"
+        required: true
+        default: "100"
+        type: string
+
+      dry_run:
+        description: "Dry run mode. Keep 'true' to preview. Change to 'false' to actually delete."
+        required: true
+        default: "true"
+        type: string
+
+      max_deletes_per_run:
+        description: "Safety limit: maximum deletions per run. Default 2000."
+        required: true
+        default: "2000"
+        type: string
+
+jobs:
+  ghcr-retention:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      ORG: ${{ github.repository_owner }}
+      PACKAGE: backend_service
+
+    steps:
+      - name: Cleanup GHCR non-production images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_LAST_NONPROD: ${{ inputs.keep_last_nonprod }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MAX_DELETES_PER_RUN: ${{ inputs.max_deletes_per_run }}
+        run: |
+          set -euo pipefail
+
+          echo "Organization: ${ORG}"
+          echo "Package: ${PACKAGE}"
+          echo "Keep last NON-prod: ${KEEP_LAST_NONPROD}"
+          echo "Dry run: ${DRY_RUN} (set to 'false' to реально удалить)"
+          echo "Max deletions per run: ${MAX_DELETES_PER_RUN}"
+
+          keep="${KEEP_LAST_NONPROD}"
+          max_del="${MAX_DELETES_PER_RUN}"
+
+          tmp="$(mktemp)"
+          echo "[]" > "${tmp}"
+
+          page=1
+          while true; do
+            echo "Fetching page ${page}..."
+
+            status=$(curl -s -o page.json -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/orgs/${ORG}/packages/container/${PACKAGE}/versions?per_page=100&page=${page}")
+
+            [[ "${status}" == "200" ]] || { echo "Failed HTTP ${status}"; cat page.json; exit 1; }
+
+            count=$(jq 'length' page.json)
+            [[ "${count}" -eq 0 ]] && break
+
+            jq -s '.[0] + .[1]' "${tmp}" page.json > "${tmp}.new"
+            mv "${tmp}.new" "${tmp}"
+
+            page=$((page+1))
+            [[ "${page}" -le 50 ]] || { echo "Too many pages, safety stop"; exit 1; }
+          done
+
+          total=$(jq 'length' "${tmp}")
+          echo "Total versions fetched: ${total}"
+
+          nonprod=$(jq '
+            [
+              .[]
+              | select( ((.metadata.container.tags // []) | map(startswith("production-v")) | any) | not )
+              | {id, created_at, tags: (.metadata.container.tags // [])}
+            ]
+            | sort_by(.created_at) | reverse
+          ' "${tmp}")
+
+          nonprod_count=$(echo "${nonprod}" | jq 'length')
+          echo "Non-production versions: ${nonprod_count}"
+
+          delete_ids_all=$(echo "${nonprod}" | jq -r --argjson KEEP "${keep}" '
+            .[ $KEEP : ] | .[] | .id
+          ')
+
+          planned_total=$(echo "${delete_ids_all}" | sed '/^$/d' | wc -l | tr -d " ")
+          echo "Planned deletions: ${planned_total}"
+
+          [[ "${planned_total}" -gt 0 ]] || { echo "Nothing to delete"; exit 0; }
+
+          delete_ids=$(echo "${delete_ids_all}" | head -n "${max_del}")
+          to_delete=$(echo "${delete_ids}" | wc -l | tr -d " ")
+
+          echo "This run will delete: ${to_delete}"
+          echo "First 50 IDs:"
+          echo "${delete_ids}" | head -n 50
+
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            echo "DRY RUN enabled — nothing deleted."
+            echo "Change dry_run to 'false' to perform real deletion."
+            exit 0
+          fi
+
+          deleted=0
+          while read -r vid; do
+            [[ -z "${vid}" ]] && continue
+
+            echo "Deleting ${vid} (${deleted}/${to_delete})"
+
+            status=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X DELETE \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/orgs/${ORG}/packages/container/${PACKAGE}/versions/${vid}")
+
+            [[ "${status}" == "204" ]] || { echo "Failed delete ${vid} HTTP ${status}"; exit 1; }
+
+            deleted=$((deleted+1))
+            echo "Deleted OK (${deleted})"
+          done <<< "${delete_ids}"
+
+          echo "Run finished."
+          echo "Deleted: ${deleted}"
+          echo "Remaining planned (approx): $((planned_total - deleted))"

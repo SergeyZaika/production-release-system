@@ -1,0 +1,234 @@
+name: Build and Deploy Backend to Kubernetes
+
+on:
+  push:
+    branches:
+      - dev
+      - stage
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: ${{ github.ref_name }}
+    env:
+      BRANCH_NAME: ${{ github.ref_name }}
+    outputs:
+      REPO_OWNER: ${{ steps.set_env.outputs.REPO_OWNER }}
+      IMAGE_TAG: ${{ steps.set_env.outputs.IMAGE_TAG }}
+      DEPLOY_IMAGE_TAG: ${{ steps.set_env.outputs.DEPLOY_IMAGE_TAG }}
+
+    steps:
+      # Step 1: Checkout the repository (full history + tags)
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Step 2: Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 3: Log in to GitHub Container Registry (GHCR)
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Step 4: Set environment variables (repository owner and image tag)
+      - name: Set environment variables
+        id: set_env
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO_OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          SHA_FULL="${GITHUB_SHA}"
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+
+          # Always keep sha-based tag:
+          IMAGE_TAG="${BRANCH_NAME}-${SHA_SHORT}"
+
+          # For stage deploy, require git tag vX.Y.Z on the current commit
+          VERSION_TAG=""
+          if [ "${BRANCH_NAME}" = "stage" ]; then
+            echo "::group::Git tag diagnostics (stage)"
+            echo "Repo owner (normalized): ${REPO_OWNER}"
+            echo "Branch name: ${BRANCH_NAME}"
+            echo "GITHUB_SHA: ${SHA_FULL}"
+            echo "SHA_SHORT: ${SHA_SHORT}"
+
+            echo "Waiting for release tag vX.Y.Z on commit ${GITHUB_SHA}..."
+
+            for i in {1..24}; do
+              git fetch --tags origin
+
+              VERSION_TAG="$(git tag --points-at "${GITHUB_SHA}" \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -n 1 \
+                || true)"
+
+              echo "Attempt ${i}/24 — VERSION_TAG='${VERSION_TAG}'"
+
+              if [ -n "${VERSION_TAG}" ]; then
+                break
+              fi
+
+              sleep 5
+            done
+
+            if [ -z "${VERSION_TAG}" ]; then
+              echo "::error title=Missing stage version tag::No git tag like vX.Y.Z points to commit ${GITHUB_SHA} after waiting 120 seconds."
+              echo "::notice title=Debug hint::Release-tag workflow may not have finished yet."
+              exit 1
+            fi
+
+            echo "::endgroup::"
+          fi
+
+          # Deploy tag:
+          # - stage with git tag vX.Y.Z -> vX.Y.Z
+          # - otherwise -> branch-sha7
+          if [ -n "${VERSION_TAG}" ]; then
+            DEPLOY_IMAGE_TAG="${VERSION_TAG}"   # vX.Y.Z
+          else
+            DEPLOY_IMAGE_TAG="${IMAGE_TAG}"           # branch-<sha7>
+          fi
+
+          # Build/push tags:
+          # - always: branch-sha7 and branch-latest
+          # - only for stage with VERSION_TAG: vX.Y.Z
+          {
+            echo "DOCKER_TAGS<<EOF"
+            echo "ghcr.io/${REPO_OWNER}/backend_service:${IMAGE_TAG}"
+            echo "ghcr.io/${REPO_OWNER}/backend_service:${BRANCH_NAME}-latest"
+            if [ -n "${VERSION_TAG}" ]; then
+              echo "ghcr.io/${REPO_OWNER}/backend_service:${DEPLOY_IMAGE_TAG}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+          echo "::group::Docker tag plan"
+          echo "IMAGE_TAG: ${IMAGE_TAG}"
+          echo "DEPLOY_IMAGE_TAG: ${DEPLOY_IMAGE_TAG}"
+          echo "VERSION_TAG: '${VERSION_TAG}'"
+          echo "Docker images to be pushed:"
+          echo "  ghcr.io/${REPO_OWNER}/backend_service:${IMAGE_TAG}"
+          echo "  ghcr.io/${REPO_OWNER}/backend_service:${BRANCH_NAME}-latest"
+          if [ -n "${VERSION_TAG}" ]; then
+            echo "  ghcr.io/${REPO_OWNER}/backend_service:${DEPLOY_IMAGE_TAG}"
+          fi
+          echo "::endgroup::"
+
+          echo "REPO_OWNER=${REPO_OWNER}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "DEPLOY_IMAGE_TAG=${DEPLOY_IMAGE_TAG}" >> "$GITHUB_ENV"
+
+          echo "REPO_OWNER=${REPO_OWNER}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "DEPLOY_IMAGE_TAG=${DEPLOY_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      # Step 5: Build and push Docker image (with cache)
+      - name: Build and push Docker image (with cache)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          target: production
+          build-args: |
+            NODE_ENV=production
+            NEXT_PHASE=phase-production-build
+          tags: ${{ env.DOCKER_TAGS }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+  deploy_to_k8s:
+    needs: build_and_push
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: ${{ github.ref_name }}
+    env:
+      REPO_OWNER: ${{ needs.build_and_push.outputs.REPO_OWNER }}
+      IMAGE_TAG: ${{ needs.build_and_push.outputs.DEPLOY_IMAGE_TAG }}
+      NAMESPACE: ${{ github.ref_name }}
+      RUN_MIGRATION: 'true' # Start migration! true or false
+
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Install kubectl
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.27.3'
+
+      # Step 3: Configure Kubernetes access using Kubeconfig
+      - name: Set up Kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_EU_1 }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      # Step 4: Logs of RUN_MIGRATION
+      - name: Show RUN_MIGRATION value
+        run: |
+          echo "RUN_MIGRATION is: $RUN_MIGRATION"
+
+      # Step 5: Clean old job backend-migration-job before new run
+      - name: Delete old migration job if exists
+        if: env.RUN_MIGRATION == 'true'
+        run: |
+          kubectl delete job backend-migration -n "$NAMESPACE" || true
+
+      # Step 6: MIGRATION. run migration job if enabled
+      - name: Run migration job if enabled
+        if: env.RUN_MIGRATION == 'true'
+        shell: bash
+        run: |
+          echo "Running migration job..."
+          envsubst < k8s/backend-migration-job.yaml | kubectl apply -n "$NAMESPACE" -f -
+
+      # Step 7: Wait for migration job to finish and show logs
+      - name: Wait for migration to complete and show logs
+        if: env.RUN_MIGRATION == 'true'
+        run: |
+          chmod +x  scripts/wait_for_migration.sh
+          scripts/wait_for_migration.sh
+
+      # Step 8: Clean backend-migration-job after run job
+      - name: Cleanup finished migration job
+        if: env.RUN_MIGRATION == 'true'
+        run: |
+          sleep 10
+          kubectl delete job backend-migration -n "$NAMESPACE" || true
+
+      # Step 9: Apply Kubernetes Deployment with real image tag
+      - name: Apply Kubernetes Deployment with real image tag
+        shell: bash
+        run: |
+          if [ -z "$REPO_OWNER" ] || [ -z "$IMAGE_TAG" ]; then
+            echo "ERROR: REPO_OWNER or IMAGE_TAG is empty!"
+            exit 1
+          fi
+          IMAGE_NAME="ghcr.io/${REPO_OWNER}/backend_service:${IMAGE_TAG}"
+          echo "Applying deployment with image: $IMAGE_NAME"
+          sed -E \
+            -e "s|ghcr.io/REPO_OWNER/backend_service:will-be-overwritten-by-ci|${IMAGE_NAME}|g" \
+            k8s/backend-deployment.yaml | kubectl apply -n "$NAMESPACE" -f -
+
+      # Step 10: Verify the deployment status
+      - name: Verify Deployment Status
+        shell: bash
+        run: |
+          kubectl rollout status deployment/backend-deployment -n "$NAMESPACE"
+          kubectl get pods -n "$NAMESPACE" --no-headers -o wide

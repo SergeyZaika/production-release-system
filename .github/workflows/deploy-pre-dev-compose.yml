@@ -1,0 +1,134 @@
+# ================================
+# REQUIRED SECRETS
+#
+#  SSH_HOST          = <IP or hostname of your Ubuntu server>
+#  SSH_USER          = <ssh user, e.g. 'root'>
+#  SSH_PRIVATE_KEY   = <private key contents for SSH_USER>
+#
+#  GHCR_USER         = <your GitHub login, e.g. 'your-github-username'>
+#  GHCR_TOKEN        = <Personal Access Token with scope: read:packages>
+#  
+#  COMPOSE_DIR       = </absolute/path/on/server, e.g. /root/node-next-docker-stack>
+# ================================
+
+name: Build and Deploy Backend to Ubuntu (Docker Compose)
+
+on:
+  push:
+    branches: [pre-dev]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: pre-dev
+    env:
+      BRANCH_NAME: ${{ github.ref_name }}
+    outputs:
+      REPO_OWNER: ${{ steps.set_env.outputs.REPO_OWNER }}
+      IMAGE_TAG: ${{ steps.set_env.outputs.IMAGE_TAG }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Set env (owner/tag)
+        id: set_env
+        run: |
+          REPO_OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          SHA_SHORT=${GITHUB_SHA:0:7}
+          IMAGE_TAG="${{ env.BRANCH_NAME }}-${SHA_SHORT}"
+          echo "REPO_OWNER=${REPO_OWNER}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "REPO_OWNER=${REPO_OWNER}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (production target)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          target: production
+          build-args: |
+            NODE_ENV=production
+            NEXT_PHASE=phase-production-build
+          tags: |
+            ghcr.io/${{ env.REPO_OWNER }}/backend_service:${{ env.IMAGE_TAG }}
+            ghcr.io/${{ env.REPO_OWNER }}/backend_service:${{ env.BRANCH_NAME }}-latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+  deploy_to_server:
+    needs: build_and_push
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: pre-dev
+    env:
+      REPO_OWNER: ${{ needs.build_and_push.outputs.REPO_OWNER }}
+      IMAGE_TAG: ${{ needs.build_and_push.outputs.IMAGE_TAG }}
+      BRANCH_NAME: pre-dev
+      SERVICE_NAME: backend
+      COMPOSE_DIR: ${{ vars.COMPOSE_DIR }}
+
+    steps:
+      - name: Deploy over SSH (docker compose up -d backend)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # default port 22 is used automatically
+          script_stop: true
+          envs: REPO_OWNER,IMAGE_TAG,BRANCH_NAME,SERVICE_NAME,COMPOSE_DIR
+          script: |
+            set -Eeuo pipefail
+
+            COMPOSE_DIR="$(printf '%s' "$COMPOSE_DIR" | tr -d '\r\n')"
+
+            if [ -z "${COMPOSE_DIR:-}" ]; then
+              echo "COMPOSE_DIR is not set"; exit 1; fi
+
+            IMAGE="ghcr.io/${REPO_OWNER}/backend_service:${IMAGE_TAG}"
+            echo "Using image: ${IMAGE}"
+
+            cd "${COMPOSE_DIR}"
+
+
+            # Login to GHCR on the server (requires PAT with read:packages)
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USER }}" --password-stdin
+
+            # Pull image (ok if cached)
+            docker pull "${IMAGE}" || true
+
+            # Write override strictly line-by-line to avoid YAML injection/format issues
+            printf '%s\n' \
+              "services:" \
+              "  ${SERVICE_NAME}:" \
+              "    image: ${IMAGE}" \
+              "    pull_policy: always" \
+              > docker-compose.ci.override.yml
+
+            echo "---- docker-compose.ci.override.yml ----"
+            cat docker-compose.ci.override.yml
+            echo "----------------------------------------"
+
+            # Validate compose before applying
+            docker compose -f docker-compose.yml -f docker-compose.ci.override.yml config >/dev/null
+
+            # Update ONLY backend service; .env and main compose remain intact
+            docker compose -f docker-compose.yml -f docker-compose.ci.override.yml up -d ${SERVICE_NAME}
+
+            # Optional clean-up of dangling images
+            docker image prune -f || true
+
+            echo "Deployed ${SERVICE_NAME} with ${IMAGE}"

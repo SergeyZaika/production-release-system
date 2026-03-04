@@ -1,0 +1,491 @@
+name: 1. DEV > STAGE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  SOURCE_BRANCH: dev
+  TARGET_BRANCH: stage
+  TAG_PREFIX: "v"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # --------------------------------------------------------------------
+      # Guard: workflow must be started from SOURCE_BRANCH only
+      # --------------------------------------------------------------------
+      - name: Guard source branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_name }}" != "${SOURCE_BRANCH}" ]; then
+            echo "This workflow must be executed from '${SOURCE_BRANCH}' branch."
+            exit 1
+          fi
+
+      # --------------------------------------------------------------------
+      # GitHub App authentication (release bot)
+      # --------------------------------------------------------------------
+      - name: Get GitHub App token
+        id: bot
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      # --------------------------------------------------------------------
+      # Warm-up GitHub App token (avoid sporadic "Repository not found")
+      # --------------------------------------------------------------------
+      - name: Warm up repo access (GitHub App token)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.bot.outputs.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const maxAttempts = 6;
+            const delayMs = 3000;
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              try {
+                await github.rest.repos.get({ owner, repo });
+                core.info(`Repo access OK: ${owner}/${repo} (attempt ${attempt}/${maxAttempts})`);
+                return;
+              } catch (e) {
+                const status = e?.status || 'unknown';
+                core.warning(`Repo access not ready yet (attempt ${attempt}/${maxAttempts}): HTTP ${status}`);
+                if (attempt === maxAttempts) throw e;
+                await new Promise(r => setTimeout(r, delayMs));
+              }
+            }
+
+      # --------------------------------------------------------------------
+      # Checkout SOURCE branch with full git history
+      # --------------------------------------------------------------------
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ steps.bot.outputs.token }}
+
+      # --------------------------------------------------------------------
+      # Fetch TARGET branch and all existing git tags
+      # --------------------------------------------------------------------
+      - name: Fetch target branch and tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ env.TARGET_BRANCH }}"
+          git fetch --tags origin
+
+      # --------------------------------------------------------------------
+      # Detect base version from latest semver tag on TARGET branch
+      # - Only tags in format ${TAG_PREFIX}X.Y.Z are considered
+      # - Namespace tags like production/vX.Y.Z are ignored
+      # - Fallback: ${TAG_PREFIX}0.0.0 if no matching tags exist yet
+      # --------------------------------------------------------------------
+      - name: Detect base tag from target (fallback PREFIX0.0.0)
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_REF="origin/${{ env.TARGET_BRANCH }}"
+
+          BASE_TAG="$(
+            git tag --merged "$TARGET_REF" \
+              | awk -v p="^${TAG_PREFIX}[0-9]+\\.[0-9]+\\.[0-9]+$" '$0 ~ p {print}' \
+              | sort -V \
+              | tail -n 1
+          )"
+
+          if [ -z "${BASE_TAG:-}" ]; then
+            BASE_TAG="${TAG_PREFIX}0.0.0"
+            echo "No matching tags found on target branch. Using base tag: ${BASE_TAG}"
+          else
+            echo "Base tag (from target): ${BASE_TAG}"
+          fi
+          
+          echo "DEBUG: resolved BASE_TAG=${BASE_TAG}"
+          
+          if ! echo "$BASE_TAG" | grep -Eq "^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+$"; then
+            echo "ERROR: Base tag must be in format ${TAG_PREFIX}X.Y.Z, got: '$BASE_TAG'"
+            exit 1
+          fi
+
+          BASE_VERSION="${BASE_TAG#${TAG_PREFIX}}"
+          echo "base_tag=${BASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------------------
+      # Setup Node.js runtime
+      # --------------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # --------------------------------------------------------------------
+      # Install semantic-release libs (CI-only)
+      # --------------------------------------------------------------------
+      - name: Install semantic-release libs (CI-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm init -y >/dev/null 2>&1 || true
+          npm install --no-save @semantic-release/commit-analyzer @semantic-release/release-notes-generator conventional-changelog-conventionalcommits
+
+      # --------------------------------------------------------------------
+      # Analyze commits between TARGET..SOURCE using PR data (no grep, no log parsing)
+      # - For merge commits: resolve PR by commit SHA -> use PR title + PR commits
+      # - For regular commits: use commit subject+body
+      # - IMPORTANT: semantic-release plugins expect commits in context.commits
+      # --------------------------------------------------------------------
+      - name: Analyze commits (PR-aware) and build release notes
+        id: analyze
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BASE_TAG: ${{ steps.base.outputs.base_tag }}
+          TAG_PREFIX: ${{ env.TAG_PREFIX }}
+          SOURCE_BRANCH: ${{ env.SOURCE_BRANCH }}
+          TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
+          REPO: ${{ github.repository }}
+          API_URL: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+
+          node <<'NODE'
+          const { execSync } = require('child_process');
+          const fs = require('fs');
+
+          const analyzer = require('@semantic-release/commit-analyzer');
+          const notesGen = require('@semantic-release/release-notes-generator');
+          const presetConfig = require('conventional-changelog-conventionalcommits');
+
+          function git(cmd) {
+            return execSync(`git ${cmd}`, { encoding: 'utf8' }).trim();
+          }
+
+          const out = process.env.GITHUB_OUTPUT;
+          const setOut = (k, v) => fs.appendFileSync(out, `${k}=${v}\n`);
+
+          const baseTag = process.env.BASE_TAG;
+          const sourceRef = `origin/${process.env.SOURCE_BRANCH}`;
+          const targetRef = `origin/${process.env.TARGET_BRANCH}`;
+
+          const apiUrl = process.env.API_URL;
+          const repo = process.env.REPO;
+          const token = process.env.GH_TOKEN;
+
+          if (!token) {
+            console.error('ERROR: GH_TOKEN is missing');
+            process.exit(1);
+          }
+
+          async function gh(path) {
+            const res = await fetch(`${apiUrl}${path}`, {
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github+json'
+              }
+            });
+            if (!res.ok) {
+              const txt = await res.text().catch(() => '');
+              throw new Error(`GitHub API ${path} failed: ${res.status} ${res.statusText} ${txt}`);
+            }
+            return res.json();
+          }
+
+          async function ghWithPreview(path) {
+            const res = await fetch(`${apiUrl}${path}`, {
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.groot-preview+json'
+              }
+            });
+            if (!res.ok) {
+              const txt = await res.text().catch(() => '');
+              throw new Error(`GitHub API (preview) ${path} failed: ${res.status} ${res.statusText} ${txt}`);
+            }
+            return res.json();
+          }
+
+          function isMergeCommit(sha) {
+            // "git rev-list --parents -n 1" outputs: <sha> <p1> <p2> ...
+            const safeSha = String(sha || '').trim().replace(/[^0-9a-f]/gi, '');
+            if (!safeSha) return false;
+
+            const line = git(`rev-list --parents -n 1 ${safeSha}`);
+            const parts = line.split(/\s+/).filter(Boolean);
+            return parts.length > 2;
+          }
+
+          function getRawRangeCommits() {
+            // Returns array of { sha, subject, body }
+            const raw = git(`log --format=%H%x01%s%x01%b%x02 ${targetRef}..${sourceRef} || true`);
+            if (!raw) return [];
+            return raw
+              .split('\x02')
+              .filter(Boolean)
+              .map(b => {
+                const [h, s, bod] = b.split('\x01');
+                return { sha: h, subject: s || '', body: (bod || '').trim() };
+              });
+          }
+
+          async function resolvePrByMergeSha(sha) {
+            // Find PR(s) associated with this commit SHA
+            const prs = await ghWithPreview(`/repos/${repo}/commits/${sha}/pulls`);
+            if (!Array.isArray(prs) || prs.length === 0) return null;
+
+            // Prefer merged PR if present
+            const merged = prs.find(p => p && p.merged_at);
+            return merged || prs[0] || null;
+          }
+
+          async function listPrCommits(prNumber) {
+            // Paginate commits (100 per page)
+            const all = [];
+            let page = 1;
+            while (true) {
+              const batch = await gh(`/repos/${repo}/pulls/${prNumber}/commits?per_page=100&page=${page}`);
+              if (!Array.isArray(batch) || batch.length === 0) break;
+              for (const c of batch) {
+                const msg = c?.commit?.message || '';
+                const sha = c?.sha || '';
+                if (sha && msg) all.push({ hash: sha, message: msg.trim() });
+              }
+              if (batch.length < 100) break;
+              page += 1;
+            }
+            return all;
+          }
+
+          function normalizeMessage(subject, body) {
+            const s = (subject || '').trim();
+            const b = (body || '').trim();
+            return b ? `${s}\n\n${b}` : s;
+          }
+
+          (async () => {
+            const rangeCommits = getRawRangeCommits();
+
+            if (!rangeCommits.length) {
+              setOut('has_release', 'false');
+              setOut('bump_type', '');
+              setOut('release_notes', '');
+              console.log('No commits to release (SOURCE has nothing ahead of TARGET).');
+              return;
+            }
+
+            const collected = [];
+            for (const c of rangeCommits) {
+              if (isMergeCommit(c.sha)) {
+                const pr = await resolvePrByMergeSha(c.sha);
+                if (pr && pr.number) {
+                  // Use PR title as a "virtual commit" first (helps if internal commits are non-conventional)
+                  const prTitle = (pr.title || '').trim();
+                  const prBody = (pr.body || '').trim();
+                  const prText = prBody ? `${prTitle}\n\n${prBody}` : prTitle;
+                  if (prText) {
+                    collected.push({ hash: c.sha, message: prText });
+                  }
+
+                  const prCommits = await listPrCommits(pr.number);
+                  for (const pc of prCommits) collected.push(pc);
+
+                  continue;
+                }
+              }
+
+              // Fallback: use commit itself (subject+body)
+              collected.push({ hash: c.sha, message: normalizeMessage(c.subject, c.body) });
+            }
+
+            // Run semantic-release plugins using context.commits (NOT third argument)
+            const tagPrefix = String(process.env.TAG_PREFIX || '');
+            const safeBaseTag = String(baseTag || '');
+            const lastVersion = safeBaseTag.startsWith(tagPrefix)
+              ? safeBaseTag.slice(tagPrefix.length)
+              : safeBaseTag;
+
+            const context = {
+              logger: console,
+              options: {
+                repositoryUrl: process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY
+                  ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}`
+                  : ''
+              },
+              commits: collected,
+              lastRelease: { gitTag: safeBaseTag, version: lastVersion }
+            };
+
+            const bump = await analyzer.analyzeCommits(
+              { preset: 'conventionalcommits' },
+              context
+            );
+
+            if (!bump) {
+              setOut('has_release', 'false');
+              setOut('bump_type', '');
+              setOut('release_notes', '');
+              console.log(`Analysis of ${collected.length} commit entries complete: no release`);
+              return;
+            }
+
+            const notes = await notesGen.generateNotes(
+              { preset: 'conventionalcommits', presetConfig },
+              {
+                ...context,
+                nextRelease: { gitTag: '', version: '' }
+              }
+            );
+
+            setOut('has_release', 'true');
+            setOut('bump_type', bump);
+            fs.appendFileSync(out, `release_notes<<EOF\n${notes || ''}\nEOF\n`);
+            console.log(`Release detected: ${bump}`);
+          })().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
+          NODE
+
+      # --------------------------------------------------------------------
+      # Stop pipeline if no release-worthy commits detected
+      # --------------------------------------------------------------------
+      - name: No release required
+        if: steps.analyze.outputs.has_release != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=No release required::No major/minor/patch detected (or nothing to release)."
+
+      # --------------------------------------------------------------------
+      # Calculate next version strictly from git tags (vX.Y.Z)
+      # --------------------------------------------------------------------
+      - name: Calculate next version from base tag (tags-only, strict)
+        id: next
+        if: steps.analyze.outputs.has_release == 'true'
+        shell: bash
+        env:
+          BASE_VERSION: ${{ steps.base.outputs.base_version }}
+          BUMP_TYPE: ${{ steps.analyze.outputs.bump_type }}
+        run: |
+          set -euo pipefail
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${BASE_VERSION}"
+
+          case "${BUMP_TYPE}" in
+            patch) PATCH=$((PATCH + 1)) ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            *) echo "ERROR: Unsupported bump type: '${BUMP_TYPE}'"; exit 1 ;;
+          esac
+
+          NEXT_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          NEXT_TAG="${TAG_PREFIX}${NEXT_VERSION}"
+
+          git fetch --tags origin
+          if git rev-parse -q --verify "refs/tags/${NEXT_TAG}" >/dev/null 2>&1; then
+            echo "ERROR: Tag already exists: ${NEXT_TAG}"
+            exit 1
+          fi
+
+          echo "next_version=${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "next_tag=${NEXT_TAG}" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------------------
+      # Create RC branch (no VERSION file, no code changes)
+      # - RC branch exists only to create a PR into TARGET
+      # --------------------------------------------------------------------
+      - name: Create RC branch (no VERSION file, no code changes)
+        if: steps.analyze.outputs.has_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.next.outputs.next_version }}"
+          BRANCH="release/rc/${VERSION}"
+
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "ERROR: RC branch already exists: $BRANCH"
+            exit 1
+          fi
+
+          git checkout -b "$BRANCH"
+
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+          git commit --allow-empty -m "chore(release): open RC for ${{ steps.next.outputs.next_tag }}"
+          git push origin "$BRANCH"
+
+      # --------------------------------------------------------------------
+      # Create Release Candidate PR into TARGET branch
+      # --------------------------------------------------------------------
+      - name: Create Release Candidate PR
+        if: steps.analyze.outputs.has_release == 'true'
+        uses: actions/github-script@v7
+        env:
+          RELEASE_NOTES: ${{ steps.analyze.outputs.release_notes }}
+        with:
+          github-token: ${{ steps.bot.outputs.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const version = "${{ steps.next.outputs.next_version }}";
+            const tag = "${{ steps.next.outputs.next_tag }}";
+            const head = "release/rc/" + version;
+            const base = process.env.TARGET_BRANCH;
+
+            const bumpType = "${{ steps.analyze.outputs.bump_type }}";
+            const notes = process.env.RELEASE_NOTES || "";
+
+            const body = [
+              "Release candidate",
+              "",
+              "Source: **" + process.env.SOURCE_BRANCH + "**",
+              "Target: **" + process.env.TARGET_BRANCH + "**",
+              "Bump type: **" + bumpType + "**",
+              "Version: **" + version + "**",
+              "Tag to be created after merge: **" + tag + "**",
+              "",
+              "## Release notes",
+              "",
+              notes || "(no release notes)"
+            ].join("\n");
+
+            const pr = await github.rest.pulls.create({
+              owner,
+              repo,
+              head,
+              base,
+              title: "Release Candidate " + tag,
+              body
+            });
+
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: pr.data.number,
+              labels: ["release", "tag:" + tag]
+            });
+
+            console.log("Release PR created: " + pr.data.html_url);
