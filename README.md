@@ -4,6 +4,45 @@ Opinionated Production Release System for Kubernetes-based services built with G
 
 ---
 
+## Problem
+
+Most teams ship to production without a controlled release process:
+
+- no clear separation between dev, staging, and production environments
+- manual git tags and GitHub Releases, prone to human error
+- unpredictable versioning — no consistent semver across releases
+- no explicit promotion step before production deploy
+- direct pushes to production branches with no review gate
+
+---
+
+## Solution
+
+This repository demonstrates a production-grade release system built on GitHub Actions and Kubernetes.
+
+The system enforces a structured release workflow where:
+- versions are calculated automatically from commit history
+- release candidate branches and PRs are created by automation, not by hand
+- git tags and GitHub Releases are created by a bot on merge, not manually
+- production artifacts are explicitly promoted from a verified stage image
+- deployment to production is a deliberate, two-step manual action
+
+---
+
+## Key Features
+
+- deterministic semantic versioning from commit history
+- automated creation of release candidate branches
+- automated Git tag and GitHub Release creation
+- Kubernetes deployments for dev and stage environments
+- controlled promotion of artifacts to production
+- immutable Docker images stored in GHCR
+- separation between build, release, and deploy stages
+
+This repository focuses on release engineering rather than application code.
+
+---
+
 ## Overview
 
 - Development happens in the `dev` branch
@@ -187,17 +226,9 @@ Only `production-vX.Y.Z` images are deployed to production namespaces.
 
 | Environment | Infrastructure | Trigger |
 |---|---|---|
-| `pre-dev` | Ubuntu server, **Docker Compose** | push to `pre-dev` branch |
 | `dev` | Kubernetes namespace `dev` | push to `dev` branch |
 | `stage` | Kubernetes namespace `stage` | push to `stage` branch |
 | `prod-region-*` | Kubernetes namespaces | manual workflow dispatch |
-
-### pre-dev
-
-Deployed via `deploy-pre-dev-compose.yml`. Uses SSH + Docker Compose, not Kubernetes. Intended for early integration testing before `dev`.
-
-Required secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`, `GHCR_USER`, `GHCR_TOKEN`.
-Required variable: `COMPOSE_DIR` (absolute path on the server).
 
 ### dev / stage
 
@@ -222,8 +253,6 @@ Used by `dev-to-stage`, `create-release-tag`, and `promote-release-to-production
 | `RELEASE_BOT_APP_ID` | GitHub App ID |
 | `RELEASE_BOT_PRIVATE_KEY` | GitHub App private key |
 
-The GitHub App must have write access to `contents` and `pull-requests` on the repository.
-
 ### Repository variables
 
 | Variable | Used by | Description |
@@ -231,6 +260,32 @@ The GitHub App must have write access to `contents` and `pull-requests` on the r
 | `CODEOWNERS_LOGINS` | `cicd-guard` | Comma-separated GitHub logins of CI/CD owners |
 | `ALLOWED_ACTORS` | `promote-release-to-production` | Comma-separated GitHub logins allowed to promote to production |
 | `COMPOSE_DIR` | `deploy-pre-dev-compose` | Absolute path to Docker Compose directory on the pre-dev server |
+
+---
+
+## ReleaseBot
+
+ReleaseBot is a GitHub App used by the CI/CD pipeline for release operations.
+
+Used by workflows to:
+- create git tags
+- create GitHub Releases
+- open and manage Pull Requests
+- set labels on PRs
+- interact with GitHub Actions workflows
+- delete old container images from GitHub Container Registry
+
+**Permissions required for ReleaseBot (GitHub App):**
+
+| Permission | Level |
+|---|---|
+| Contents | Read & write |
+| Pull requests | Read & write |
+| Issues | Read & write |
+| Workflows | Read & write |
+| Packages | Read, Write, Delete |
+
+> GitHub App is created at the organization level. Permissions are configured when creating the app.
 
 ---
 
@@ -306,3 +361,14 @@ Rulesets are defined in [`repository-rules/`](repository-rules/) and applied via
   - Tag creation, update, and deletion restricted to bypass actors only
   - Bypass actors: GitHub App (release bot), organization admins, repository admins
 - **Why:** prevents manual tag creation; all `vX.Y.Z` and `production/vX.Y.Z` tags are created exclusively by workflows via the GitHub App
+
+---
+
+### Optional Docker Compose environment
+
+`pre-dev` is an optional environment for experiments or early integration testing. It is not part of the main CI/CD pipeline.
+
+Deployment is handled by `deploy-pre-dev-compose.yml` and uses Docker Compose over SSH (not Kubernetes).
+
+Required secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`, `GHCR_USER`, `GHCR_TOKEN`.
+Required variable: `COMPOSE_DIR` (absolute path on the server).
