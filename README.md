@@ -1,6 +1,6 @@
 # Opinionated Production Release System
 
-Opinionated Production Release System based on GitHub Actions, semantic versioning, and immutable Docker images.
+Opinionated Production Release System for Kubernetes-based services built with GitHub Actions, semantic versioning, and immutable Docker images.
 
 ---
 
@@ -13,6 +13,18 @@ Opinionated Production Release System based on GitHub Actions, semantic versioni
 
 Docker images are stored in GitHub Container Registry (GHCR).
 Git tags and GitHub Releases are created automatically on merge to `stage`.
+
+---
+
+## Repository Structure
+
+```
+.github/workflows/  — CI/CD pipelines
+k8s/                — Kubernetes manifests used for deployments
+repository-rules/   — GitHub repository protection rulesets
+scripts/            — helper scripts used by workflows
+README.md           — system documentation
+```
 
 ---
 
