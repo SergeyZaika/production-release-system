@@ -1,0 +1,46 @@
+{
+  "id": 12059605,
+  "name": "release-rc-protected",
+  "target": "branch",
+  "source_type": "Repository",
+  "source": "YOUR_ORG/YOUR_REPO",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": [
+        "refs/heads/release/rc/*"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    }
+  ],
+  "bypass_actors": [
+    {
+      "actor_id": null,
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "always"
+    },
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    },
+    {
+      "actor_id": 2680199,
+      "actor_type": "Integration",
+      "bypass_mode": "always"
+    },
+    {
+      "actor_id": 15459274,
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    }
+  ]
+}
